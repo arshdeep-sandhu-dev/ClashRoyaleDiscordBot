@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import io
 import json
 import os
@@ -8,6 +9,7 @@ from collections import Counter
 import chat_exporter
 import discord
 from discord import app_commands
+from discord.ext import tasks
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "env.env"))
@@ -22,6 +24,13 @@ GUILD = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "ticket_config.json")
 # Transcripts and details behind each log entry's dropdown
 LOG_DIR = os.path.join(os.path.dirname(__file__), "ticket_logs")
+
+# Closed tickets get deleted once they've been closed this long, checked on a timer (both in minutes)
+DELETE_CLOSED_AFTER = datetime.timedelta(minutes=float(os.environ.get("DELETE_CLOSED_AFTER_MINUTES", 1)))
+CLEANUP_CHECK_MINUTES = float(os.environ.get("CLEANUP_CHECK_MINUTES", 1))
+
+# The staff controls message posted on close; its timestamp is when the ticket was closed
+CLOSED_CONTROLS_TEXT = "```Support team ticket controls```"
 
 GREEN = discord.Color.from_rgb(59, 165, 93)
 YELLOW = discord.Color.from_rgb(250, 168, 26)
@@ -342,6 +351,12 @@ class ApplicationModal(discord.ui.Modal, title="Please fill this out"):
             embeds=[with_footer(welcome), answers],
             view=TicketView(),
         )
+
+        # Link to their profile from the player tag answer (the last question)
+        tag = re.sub(r"[^A-Z0-9]", "", self.answers[-1].value.upper())
+        if tag:
+            await channel.send(f"https://clashspot.net/en/player/{tag}/view")
+
         await interaction.followup.send(f"Ticket created: {channel.mention}", ephemeral=True)
         await send_to_log(guild, f"🎫 **Ticket Opened** - {user.mention} - {channel.mention}")
 
@@ -463,7 +478,7 @@ async def close_ticket(interaction: discord.Interaction):
             pass  # they have DMs turned off
 
     await channel.send(
-        embed=discord.Embed(description="```Support team ticket controls```", color=GRAY), view=ClosedView()
+        embed=discord.Embed(description=CLOSED_CONTROLS_TEXT, color=GRAY), view=ClosedView()
     )
 
     # Move to the Closed category, keeping the ticket's own permissions
@@ -472,6 +487,35 @@ async def close_ticket(interaction: discord.Interaction):
         await channel.edit(category=closed_category, sync_permissions=False)
     # Discord only allows 2 renames per channel every 10 minutes, so this can be delayed
     await channel.edit(name=f"closed-{channel.name}"[:100])
+
+
+async def closed_at(channel: discord.TextChannel):
+    """When this ticket was last closed, from the bot's controls message. None if it isn't closed."""
+    async for message in channel.history(limit=100):
+        if message.author == channel.guild.me and message.embeds and message.embeds[0].description == CLOSED_CONTROLS_TEXT:
+            return message.created_at
+    return None
+
+
+async def delete_old_closed_tickets():
+    """Deletes tickets that have sat in the Closed category longer than DELETE_CLOSED_AFTER."""
+    now = discord.utils.utcnow()
+    for guild in client.guilds:
+        closed_category = guild.get_channel(guild_settings(guild).get("closed_category_id") or 0)
+        if not isinstance(closed_category, discord.CategoryChannel):
+            continue
+        for channel in closed_category.text_channels:
+            if ticket_owner_id(channel) is None:
+                continue  # not a ticket, e.g. #ticket-logs
+            try:
+                closed_time = await closed_at(channel)
+                if closed_time is None or now - closed_time < DELETE_CLOSED_AFTER:
+                    continue
+                transcript = await build_transcript(channel)
+                await log_transcript(channel, "Auto-Deleted", client.user, transcript, RED, "⛔")
+                await channel.delete(reason="Closed ticket auto-deleted")
+            except discord.HTTPException as e:
+                print(f"Couldn't auto-delete #{channel.name}: {e}")
 
 
 # ---------- Bot ----------
@@ -491,12 +535,22 @@ class TicketBot(discord.Client):
         self.add_view(ClosedView())
         self.add_view(LogView())
 
+        self.cleanup_closed_tickets.start()
+
         if GUILD:
             self.tree.copy_global_to(guild=GUILD)
             synced = await self.tree.sync(guild=GUILD)
         else:
             synced = await self.tree.sync()
         print(f"Synced {len(synced)} command(s)")
+
+    @tasks.loop(minutes=CLEANUP_CHECK_MINUTES)
+    async def cleanup_closed_tickets(self):
+        await delete_old_closed_tickets()
+
+    @cleanup_closed_tickets.before_loop
+    async def before_cleanup(self):
+        await self.wait_until_ready()
 
 
 client = TicketBot()
