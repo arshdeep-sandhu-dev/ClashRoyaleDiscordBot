@@ -6,6 +6,7 @@ import os
 import re
 from collections import Counter
 
+import aiohttp
 import chat_exporter
 import discord
 from discord import app_commands
@@ -38,6 +39,10 @@ GREEN = discord.Color.from_rgb(59, 165, 93)
 YELLOW = discord.Color.from_rgb(250, 168, 26)
 RED = discord.Color.from_rgb(237, 66, 69)
 GRAY = discord.Color.from_rgb(47, 49, 54)
+
+# Admin commands that /role-owner opens up to chosen roles. Nobody else without Manage Server can see them.
+OWNER_COMMANDS = ["roster", "ticket-setup", "ticket-panel"]
+DISCORD_API = "https://discord.com/api/v10"
 
 # Ticket channels store their owner in the channel topic, e.g. "owner:1234 | Ticket for bob"
 OWNER_RE = re.compile(r"owner:(\d+)")
@@ -556,7 +561,7 @@ class TicketBot(discord.Client):
 
 
 client = TicketBot()
-client.tree.add_command(roster.group)  # /roster add, remove, copy, post
+client.tree.add_command(roster.group)  # /roster setup, sync, pool, add, move, remove, ...
 
 
 @client.event
@@ -694,11 +699,131 @@ async def remove(interaction: discord.Interaction, user: discord.Member):
     )
 
 
+# ---------- Owner roles ----------
+
+
+async def owner_bearer_token(session: aiohttp.ClientSession) -> str:
+    """A token that acts as the bot's owner. Discord only lets a user, not a bot, choose who sees a command."""
+    client_id = os.environ.get("bot_ClientID", "").strip()
+    secret = os.environ.get("bot_Client_Secret", "").strip()
+    if not client_id or not secret:
+        raise RuntimeError("`bot_ClientID` and `bot_Client_Secret` need to be set in env.env.")
+    async with session.post(
+        f"{DISCORD_API}/oauth2/token",
+        data={"grant_type": "client_credentials", "scope": "applications.commands.permissions.update"},
+        auth=aiohttp.BasicAuth(client_id, secret),
+    ) as resp:
+        body = await resp.json(content_type=None)
+        if resp.status != 200:
+            raise RuntimeError(f"Discord refused the client ID/secret in env.env: {body.get('error_description', body)}")
+        return body["access_token"]
+
+
+async def apply_owner_roles(guild: discord.Guild, role_ids: list[int]):
+    """Shows the OWNER_COMMANDS to these roles. They stay hidden from everyone else without Manage Server."""
+    commands = [cmd for cmd in await client.tree.fetch_commands(guild=GUILD) if cmd.name in OWNER_COMMANDS]
+    permissions = [{"id": str(role_id), "type": 1, "permission": True} for role_id in role_ids]
+    async with aiohttp.ClientSession() as session:
+        token = await owner_bearer_token(session)
+        for command in commands:
+            async with session.put(
+                f"{DISCORD_API}/applications/{client.application_id}/guilds/{guild.id}/commands/{command.id}/permissions",
+                json={"permissions": permissions},
+                headers={"Authorization": f"Bearer {token}"},
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.json(content_type=None)
+                    raise RuntimeError(
+                        f"Discord refused to update /{command.name}: {body.get('message', body)}\n"
+                        "The account that owns the bot needs Manage Server and Manage Roles in this server."
+                    )
+
+
+def owner_role_ids(guild: discord.Guild) -> list[int]:
+    # Skip roles that have since been deleted
+    return [role_id for role_id in guild_settings(guild).get("owner_role_ids", []) if guild.get_role(role_id)]
+
+
+def owner_roles_embed(guild: discord.Guild, role_ids: list[int]) -> discord.Embed:
+    roles = "\n".join(f"<@&{role_id}>" for role_id in role_ids) or "None yet, only people with Manage Server"
+    embed = discord.Embed(title="Owner roles", description=roles, color=GREEN)
+    embed.add_field(name="Commands they can use", value=" ".join(f"`/{name}`" for name in OWNER_COMMANDS))
+    embed.set_footer(text="These commands are hidden from everyone else")
+    return embed
+
+
+async def change_owner_roles(interaction: discord.Interaction, role_ids: list[int], message: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        await apply_owner_roles(interaction.guild, role_ids)
+    except (RuntimeError, aiohttp.ClientError, discord.HTTPException) as e:
+        return await interaction.followup.send(f"Couldn't change the owner roles. {e}", ephemeral=True)
+    config = load_config()
+    config.setdefault(str(interaction.guild.id), {})["owner_role_ids"] = role_ids
+    save_config(config)
+    await interaction.followup.send(message, embed=owner_roles_embed(interaction.guild, role_ids), ephemeral=True)
+
+
+role_owner = app_commands.Group(
+    name="role-owner",
+    description="Choose which roles can use the roster and ticket admin commands",
+    guild_only=True,
+    default_permissions=discord.Permissions(administrator=True),
+)
+client.tree.add_command(role_owner)
+
+
+@role_owner.command(name="add", description="Let a role use the roster and ticket admin commands")
+@app_commands.describe(role="Role to give access")
+async def role_owner_add(interaction: discord.Interaction, role: discord.Role):
+    if role.is_default():
+        return await interaction.response.send_message(
+            "Pick a real role, not @everyone, otherwise everyone could use them.", ephemeral=True
+        )
+    role_ids = owner_role_ids(interaction.guild)
+    if role.id in role_ids:
+        return await interaction.response.send_message(f"{role.mention} is already an owner role.", ephemeral=True)
+    await change_owner_roles(interaction, role_ids + [role.id], f"{role.mention} can now use the admin commands.")
+
+
+@role_owner.command(name="remove", description="Take a role's access to the roster and ticket admin commands away")
+@app_commands.describe(role="Role to take access from")
+async def role_owner_remove(interaction: discord.Interaction, role: discord.Role):
+    role_ids = owner_role_ids(interaction.guild)
+    if role.id not in role_ids:
+        return await interaction.response.send_message(f"{role.mention} isn't an owner role.", ephemeral=True)
+    role_ids.remove(role.id)
+    await change_owner_roles(interaction, role_ids, f"{role.mention} can't use the admin commands anymore.")
+
+
+@role_owner.command(name="list", description="Show which roles can use the roster and ticket admin commands")
+async def role_owner_list(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=owner_roles_embed(interaction.guild, owner_role_ids(interaction.guild)), ephemeral=True
+    )
+
+
+def can_see(member: discord.abc.User, cmd: app_commands.Command) -> bool:
+    """Whether this command shows up for them in Discord, so /help can leave out the rest."""
+    root = cmd.root_parent or cmd
+    if root.default_permissions is None:
+        return True
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions >= root.default_permissions:
+        return True
+    return root.name in OWNER_COMMANDS and any(role.id in owner_role_ids(member.guild) for role in member.roles)
+
+
 @client.tree.command(name="help", description="List all of the bot's commands")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title=f"{client.user.name} commands", color=GREEN)
     embed.set_thumbnail(url=client.user.display_avatar.url)
-    commands = [cmd for cmd in client.tree.walk_commands() if not isinstance(cmd, app_commands.Group)]
+    commands = [
+        cmd
+        for cmd in client.tree.walk_commands()
+        if not isinstance(cmd, app_commands.Group) and can_see(interaction.user, cmd)
+    ]
     for cmd in sorted(commands, key=lambda c: c.qualified_name):
         options = " ".join(f"<{p.name}>" if p.required else f"[{p.name}]" for p in cmd.parameters)
         embed.add_field(name=f"/{cmd.qualified_name} {options}".strip(), value=cmd.description, inline=False)
