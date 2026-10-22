@@ -3,3 +3,4 @@ __pycache__/
 ticket_logs/
 transcripts/
 ticket_config.json
+roster_data.json

@@ -12,6 +12,8 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
+import roster
+
 load_dotenv(os.path.join(os.path.dirname(__file__), "env.env"))
 
 # Use a separate bot application for tickets so it gets its own icon and commands.
@@ -554,6 +556,7 @@ class TicketBot(discord.Client):
 
 
 client = TicketBot()
+client.tree.add_command(roster.group)  # /roster add, remove, copy, post
 
 
 @client.event
@@ -695,11 +698,10 @@ async def remove(interaction: discord.Interaction, user: discord.Member):
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title=f"{client.user.name} commands", color=GREEN)
     embed.set_thumbnail(url=client.user.display_avatar.url)
-    for cmd in sorted(client.tree.get_commands(), key=lambda c: c.name):
-        options = " ".join(
-            f"<{p.name}>" if p.required else f"[{p.name}]" for p in getattr(cmd, "parameters", [])
-        )
-        embed.add_field(name=f"/{cmd.name} {options}".strip(), value=cmd.description, inline=False)
+    commands = [cmd for cmd in client.tree.walk_commands() if not isinstance(cmd, app_commands.Group)]
+    for cmd in sorted(commands, key=lambda c: c.qualified_name):
+        options = " ".join(f"<{p.name}>" if p.required else f"[{p.name}]" for p in cmd.parameters)
+        embed.add_field(name=f"/{cmd.qualified_name} {options}".strip(), value=cmd.description, inline=False)
     embed.set_footer(text="<required>  [optional]")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
